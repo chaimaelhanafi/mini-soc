@@ -1,0 +1,154 @@
+
+- name: Deploy Wazuh SIEM Stack to Docker Swarm
+  hosts: swarm_managers
+  become: yes
+  gather_facts: yes
+  vars:
+    wazuh_version: "4.7.0"
+    stack_name: "wazuh-siem"
+    deployment_timestamp: "{{ ansible_date_time.epoch }}"
+    
+  pre_tasks:
+    - name: Verify Docker is running
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Check if node is part of Docker Swarm
+      shell: docker info --format '{{.Swarm.LocalNodeState}}'
+      register: swarm_status
+      changed_when: false
+
+    - name: Fail if not in Swarm mode
+      fail:
+        msg: "Node is not part of a Docker Swarm cluster"
+      when: swarm_status.stdout != "active"
+
+  roles:
+    - role: docker-swarm
+      tags: [swarm, infrastructure]
+    - role: wazuh-deploy
+      tags: [wazuh, deployment]
+    - role: tls-manager
+      tags: [tls, security]
+
+  post_tasks:
+    - name: Wait for stack to be deployed
+      shell: |
+        docker stack services {{ stack_name }} --format "table {{.Name}}\t{{.Replicas}}" | 
+        tail -n +2 | 
+        awk '{split($2,a,"/"); if(a[1] != a[2]) exit 1}' || exit 1
+      register: stack_status
+      until: stack_status.rc == 0
+      retries: 30
+      delay: 10
+      tags: [verification]
+
+    - name: Display deployment summary
+      debug:
+        msg: |
+          Wazuh Stack Deployment Summary:
+          - Stack Name: {{ stack_name }}
+          - Version: {{ wazuh_version }}
+          - Deployment Time: {{ deployment_timestamp }}
+          - Dashboard URL: https://{{ wazuh_dashboard_domain }}
+          - Manager API: https://{{ wazuh_manager_domain }}:55000
+      tags: [summary]
+
+---
+# ansible/roles/docker-swarm/tasks/main.yml
+- name: Initialize Docker Swarm (if not already initialized)
+  docker_swarm:
+    state: present
+    advertise_addr: "{{ ansible_default_ipv4.address }}"
+  register: swarm_init
+  when: inventory_hostname == groups['swarm_managers'][0]
+
+- name: Get Swarm join tokens
+  docker_swarm_info:
+  register: swarm_info
+  when: inventory_hostname == groups['swarm_managers'][0]
+
+- name: Set manager join token fact
+  set_fact:
+    manager_token: "{{ swarm_info.swarm_facts.JoinTokens.Manager }}"
+    worker_token: "{{ swarm_info.swarm_facts.JoinTokens.Worker }}"
+  when: inventory_hostname == groups['swarm_managers'][0]
+
+- name: Propagate join tokens to other nodes
+  set_fact:
+    manager_token: "{{ hostvars[groups['swarm_managers'][0]]['manager_token'] }}"
+    worker_token: "{{ hostvars[groups['swarm_managers'][0]]['worker_token'] }}"
+  when: inventory_hostname != groups['swarm_managers'][0]
+
+- name: Join additional managers to Swarm
+  docker_swarm:
+    state: join
+    advertise_addr: "{{ ansible_default_ipv4.address }}"
+    join_token: "{{ manager_token }}"
+    remote_addrs: ["{{ hostvars[groups['swarm_managers'][0]]['ansible_default_ipv4']['address'] }}:2377"]
+  when: 
+    - inventory_hostname != groups['swarm_managers'][0]
+    - inventory_hostname in groups['swarm_managers']
+
+- name: Join workers to Swarm
+  docker_swarm:
+    state: join
+    advertise_addr: "{{ ansible_default_ipv4.address }}"
+    join_token: "{{ worker_token }}"
+    remote_addrs: ["{{ hostvars[groups['swarm_managers'][0]]['ansible_default_ipv4']['address'] }}:2377"]
+  when: inventory_hostname in groups.get('swarm_workers', [])
+
+- name: Create overlay networks
+  docker_network:
+    name: "{{ item.name }}"
+    driver: overlay
+    driver_options: "{{ item.options | default({}) }}"
+    attachable: "{{ item.attachable | default(true) }}"
+    state: present
+  loop:
+    - name: wazuh-frontend
+      attachable: true
+    - name: wazuh-backend
+      attachable: false
+    - name: wazuh-monitoring
+      attachable: true
+  when: inventory_hostname == groups['swarm_managers'][0]
+  tags: [networks]
+
+---
+# ansible/roles/wazuh-deploy/tasks/main.yml
+- name: Create Wazuh configuration directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - /opt/wazuh/config
+    - /opt/wazuh/certs
+    - /opt/wazuh/data/indexer
+    - /opt/wazuh/data/manager
+    - /opt/wazuh/logs
+
+- name: Generate Wazuh certificates
+  include_tasks: generate_certs.yml
+  tags: [certificates]
+
+- name: Create Docker secrets for certificates
+  docker_secret:
+    name: "{{ item.name }}"
+    data: "{{ lookup('file', item.file) | b64encode }}"
+    state: present
+    data_is_b64: true
+  loop:
+    - name: wazuh-indexer-key
+      file: "/opt/wazuh/certs/indexer-key.pem"
+    - name: wazuh-indexer-cert
+      file: "/opt/wazuh/certs/indexer.pem"
+    - name: wazuh-manager-key
+      file: "/opt/wazuh/certs/manager-key.pem"
+    - name: wazuh-manager-cert
+      file: "/opt/wazuh/certs/manager.pem"
+    - name: wazuh-dashboard-key
+      file: "/opt/wazuh/certs/dashboard-key.pem
