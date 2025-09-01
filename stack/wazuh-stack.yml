@@ -1,1 +1,38 @@
 
+services:
+  wazuh-indexer:
+    image: wazuh/wazuh-indexer:4.7.0
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+    networks:
+      - wazuh-backend
+    volumes:
+      - indexer-data:/var/lib/wazuh-indexer
+    secrets:
+      - indexer-certs
+  
+  wazuh-manager:
+    image: wazuh/wazuh-manager:4.7.0
+    deploy:
+      replicas: 1
+    networks:
+      - wazuh-backend
+    volumes:
+      - manager-data:/var/ossec/var/ossec
+      - manager-logs:/var/ossec/logs
+    secrets:
+      - manager-config
+  
+  wazuh-dashboard:
+    image: wazuh/wazuh-dashboard:4.7.0
+    deploy:
+      replicas: 1
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.wazuh.rule=Host(`wazuh.yourdomain.com`)"
+        - "traefik.http.routers.wazuh.tls.certresolver=letsencrypt"
+    networks:
+      - wazuh-frontend
+      - wazuh-backend
