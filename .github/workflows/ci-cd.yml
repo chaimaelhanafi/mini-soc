@@ -1,1 +1,347 @@
+name: Mini SOC CI/CD Pipeline
 
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository }}
+  TRIVY_SEVERITY: CRITICAL,HIGH
+  DOCKER_BUILDKIT: 1
+
+jobs:
+  changes:
+    runs-on: [self-hosted, linux]
+    outputs:
+      docker: ${{ steps.changes.outputs.docker }}
+      ansible: ${{ steps.changes.outputs.ansible }}
+      tests: ${{ steps.changes.outputs.tests }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - uses: dorny/paths-filter@v2
+        id: changes
+        with:
+          filters: |
+            docker:
+              - 'docker/**'
+              - 'stack/**'
+            ansible:
+              - 'ansible/**'
+            tests:
+              - 'tests/**'
+
+  lint:
+    runs-on: [self-hosted, linux]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install linting tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install ansible-lint yamllint
+
+      - name: Run YAML lint
+        run: |
+          yamllint .github/workflows/
+          yamllint ansible/
+          yamllint stack/
+
+      - name: Run Ansible lint
+        run: |
+          cd ansible
+          ansible-lint playbooks/
+          ansible-lint roles/
+
+  build-and-scan:
+    runs-on: [self-hosted, linux]
+    needs: [changes, lint]
+    if: needs.changes.outputs.docker == 'true' || github.event_name == 'push'
+    strategy:
+      matrix:
+        service: [wazuh-manager, wazuh-indexer, wazuh-dashboard]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Check if custom Dockerfile exists
+        id: dockerfile-check
+        run: |
+          if [ -f "docker/${{ matrix.service }}/Dockerfile" ]; then
+            echo "custom=true" >> $GITHUB_OUTPUT
+            echo "context=docker/${{ matrix.service }}" >> $GITHUB_OUTPUT
+          else
+            echo "custom=false" >> $GITHUB_OUTPUT
+            echo "Using upstream image for ${{ matrix.service }}"
+          fi
+
+      - name: Build custom image
+        if: steps.dockerfile-check.outputs.custom == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ steps.dockerfile-check.outputs.context }}
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Pull upstream image
+        if: steps.dockerfile-check.outputs.custom == 'false'
+        run: |
+          case ${{ matrix.service }} in
+            wazuh-manager)
+              docker pull wazuh/wazuh-manager:4.7.0
+              docker tag wazuh/wazuh-manager:4.7.0 ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:latest
+              ;;
+            wazuh-indexer)
+              docker pull wazuh/wazuh-indexer:4.7.0
+              docker tag wazuh/wazuh-indexer:4.7.0 ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:latest
+              ;;
+            wazuh-dashboard)
+              docker pull wazuh/wazuh-dashboard:4.7.0
+              docker tag wazuh/wazuh-dashboard:4.7.0 ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:latest
+              ;;
+          esac
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:latest
+          format: 'sarif'
+          output: 'trivy-results-${{ matrix.service }}.sarif'
+          severity: ${{ env.TRIVY_SEVERITY }}
+          exit-code: '1'
+
+      - name: Upload Trivy scan results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: trivy-results-${{ matrix.service }}
+          path: trivy-results-${{ matrix.service }}.sarif
+
+      - name: Push image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ steps.dockerfile-check.outputs.context || '.' }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  test:
+    runs-on: [self-hosted, linux]
+    needs: [changes, build-and-scan]
+    if: needs.changes.outputs.tests == 'true' || github.event_name == 'push' || always()
+    services:
+      wazuh-test:
+        image: wazuh/wazuh-manager:4.7.0
+        ports:
+          - 1515:1515
+          - 55000:55000
+        env:
+          WAZUH_MANAGER_ROOT_CA_KEY: test-ca-key
+          WAZUH_MANAGER_ROOT_CA_CERT: test-ca-cert
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install test dependencies
+        run: |
+          cd tests
+          pip install -r selenium/requirements.txt
+          pip install -r api/requirements.txt
+
+      - name: Wait for Wazuh Manager
+        run: |
+          timeout 120 bash -c 'until curl -k -f http://localhost:55000/; do sleep 5; done'
+
+      - name: Run API health checks
+        run: |
+          cd tests/api
+          python health_checks.py
+
+      - name: Set up test environment for Selenium
+        run: |
+          # Start a minimal Wazuh dashboard for testing
+          docker run -d --name wazuh-dashboard-test \
+            -p 8443:443 \
+            -e WAZUH_API_URL=https://localhost:55000 \
+            wazuh/wazuh-dashboard:4.7.0
+          
+          # Wait for dashboard to be ready
+          timeout 120 bash -c 'until curl -k -f https://localhost:8443/; do sleep 5; done'
+
+      - name: Run Selenium tests
+        run: |
+          cd tests/selenium
+          python -m pytest test_dashboard.py -v --tb=short
+        env:
+          WAZUH_DASHBOARD_URL: https://localhost:8443
+          SELENIUM_HEADLESS: true
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-results
+          path: |
+            tests/selenium/screenshots/
+            tests/api/reports/
+
+  deploy:
+    runs-on: [self-hosted, linux]
+    needs: [build-and-scan, test, lint]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Ansible
+        run: |
+          python -m pip install --upgrade pip
+          pip install ansible ansible-core
+
+      - name: Configure Ansible
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.ANSIBLE_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ vars.DEPLOY_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Create Ansible vault key
+        run: |
+          echo "${{ secrets.ANSIBLE_VAULT_KEY }}" > .vault_key
+          chmod 600 .vault_key
+
+      - name: Run pre-deployment checks
+        run: |
+          cd ansible
+          ansible-playbook -i inventories/production/hosts.yml \
+            --vault-password-file ../.vault_key \
+            playbooks/pre-deploy-check.yml
+
+      - name: Deploy Wazuh stack
+        run: |
+          cd ansible
+          ansible-playbook -i inventories/production/hosts.yml \
+            --vault-password-file ../.vault_key \
+            playbooks/deploy.yml \
+            -e "image_tag=${{ github.sha }}" \
+            -e "deployment_timestamp=$(date -u +%Y%m%d_%H%M%S)"
+
+      - name: Post-deployment verification
+        run: |
+          cd ansible
+          ansible-playbook -i inventories/production/hosts.yml \
+            --vault-password-file ../.vault_key \
+            playbooks/post-deploy-verify.yml
+
+      - name: Run smoke tests
+        run: |
+          cd tests
+          python -m pytest api/smoke_tests.py -v
+        env:
+          WAZUH_API_URL: ${{ vars.WAZUH_API_URL }}
+          WAZUH_DASHBOARD_URL: ${{ vars.WAZUH_DASHBOARD_URL }}
+
+      - name: Cleanup vault key
+        if: always()
+        run: |
+          rm -f .vault_key
+
+  security-scan:
+    runs-on: [self-hosted, linux]
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-fs-results.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+
+      - name: Upload filesystem scan results
+        uses: actions/upload-artifact@v3
+        with:
+          name: trivy-filesystem-results
+          path: trivy-fs-results.sarif
+
+      - name: Run secrets scan
+        run: |
+          # Install and run gitleaks for secret detection
+          curl -sSfL https://github.com/zricethezav/gitleaks/releases/latest/download/gitleaks_linux_x64.tar.gz | tar -xz
+          ./gitleaks detect --source . --verbose --report-format sarif --report-path gitleaks-results.sarif
+
+      - name: Upload secrets scan results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: gitleaks-results
+          path: gitleaks-results.sarif
+
+  notify:
+    runs-on: [self-hosted, linux]
+    needs: [deploy]
+    if: always()
+    steps:- name: Notify deployment status
+        run: |
+          if [[ "${{ needs.deploy.result }}" == "success" ]]; then
+            echo "Deployment successful!"
+            # Add Slack/Teams notification here if needed
+          else
+            echo "Deployment failed!"
+            # Add failure notification here
+          fi
+    
