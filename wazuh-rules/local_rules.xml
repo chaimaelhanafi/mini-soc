@@ -1,0 +1,23 @@
+<group name="ssh,authentication,">
+  <!-- SSH Brute Force Detection -->
+  <rule id="100001" level="12">
+    <if_matched_sid>5716</if_matched_sid>
+    <same_source_ip />
+    <description>SSH brute force attack detected.</description>
+    <options>no_email_alert</options>
+    <group>authentication_failed,gdpr_IV_35.7.d,</group>
+  </rule>
+
+  <!-- SSH Successful Login After Brute Force -->
+  <rule id="100002" level="15">
+    <if_matched_sid>100001</if_matched_sid>
+    <regex>Accepted password|Accepted publickey</regex>
+    <same_source_ip />
+    <description>Successful SSH login after brute force attack from $(srcip). New user: $(user)</description>
+    <mitre>
+      <id>T1110</id>
+      <id>T1021.004</id>
+    </mitre>
+    <group>authentication_success,attack,</group>
+  </rule>
+</group>
